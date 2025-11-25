@@ -10,7 +10,6 @@ There are **zero** audio recordings in this repo. Every sound you hear is a gene
 It is lightweight, 100% open-source, and arguably distinct.
 
 ##  Features
-*   **Pure Python:** No binary blobs, just math.
 *   **Dynamic Prosody:** The engine simulates breathing, pitch drift, and tempo variance so it doesn't sound completely dead inside.
 *   **Multilingual Support (Technically):**
     *   **English:** Functional.
