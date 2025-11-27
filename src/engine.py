@@ -13,14 +13,40 @@ from src.config import (
 )
 from src.g2p import MultiLingualG2P
 
+# Try to import Cython-compiled synthesis functions (if available)
+try:
+    from src.synthesis import (
+        generate_formant_waves, apply_exponential_envelope,
+        fast_iir_filter, apply_noise_gate, normalize_audio
+    )
+    CYTHON_AVAILABLE = True
+except ImportError:
+    CYTHON_AVAILABLE = False
+
+# Use Numba JIT compilation for performance
+try:
+    from src.synthesis_numba import (
+        generate_formant_waves_jit, apply_exponential_envelope_jit,
+        fast_iir_filter_jit, apply_noise_gate_jit, normalize_audio_jit
+    )
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+
 class TailSafetyEngine:
-    def __init__(self):
+    def __init__(self, voice='default_female', voice_profile=None):
         self.fs = SAMPLE_RATE
-        self.base_pitch = 125.0
+        # Require voice profile dict to be passed
+        if voice_profile is None:
+            raise ValueError("voice_profile dict must be provided")
+        self.voice_profile = voice_profile
+        self.voice_key = voice_profile.get('name', 'unknown')
+        self.base_pitch = self.voice_profile['base_pitch']
         self.g2p = MultiLingualG2P()
         self.reset_filters()
         self.sentence_energy = 1.0
         self.tempo_clock = 0.0
+        self.pitch_contour = []  # Track intonation over utterance
 
     def reset_filters(self):
         self.zi_f = [np.zeros(2) for _ in range(4)]
@@ -97,28 +123,43 @@ class TailSafetyEngine:
             is_slow_lang = False
             if len(item) > 3: is_slow_lang = item[3]
             
-            # Prosody
-            self.sentence_energy *= 0.98 
-            if self.sentence_energy < 0.4: self.sentence_energy = 0.4
+            # Prosody - improved pitch contours and stress
+            self.sentence_energy *= 0.97  # Slightly slower decay
+            if self.sentence_energy < 0.45: self.sentence_energy = 0.45
             
-            pitch_offset = (self.sentence_energy * 20.0) + (15.0 if stress else -5.0)
-            pitch_offset += np.random.uniform(-3, 3) 
+            # Better stress and intonation
+            pitch_offset = (self.sentence_energy * 18.0)
+            if stress:
+                pitch_offset += 25.0  # Higher rise for stressed syllables
+            else:
+                pitch_offset -= 8.0   # Lower for unstressed
+            pitch_offset += np.random.uniform(-2, 2)  # Reduce jitter
             target_note = self.base_pitch + pitch_offset
-            if target_note > self.base_pitch + 50: target_note = self.base_pitch + 50
-            if target_note < 80: target_note = 80
+            if target_note > self.base_pitch + 55: target_note = self.base_pitch + 55
+            if target_note < 75: target_note = 75
             
             self.tempo_clock += 0.1
-            tempo_var = math.sin(self.tempo_clock) * 0.15 
+            tempo_var = math.sin(self.tempo_clock) * 0.12  # Reduce tempo variation
             
             p_data = PHONEMES[ph]
             base_dur = p_data[0]
             
-            if stress: base_dur *= 1.3
-            if is_slow_lang: base_dur *= 1.4 
-            if ph in ['PAUSE', 'BREATH']: base_dur = dur_ov
+            # Apply duration scaling from voice profile
+            duration_scale = self.voice_profile['duration_scale']
+            
+            if stress: 
+                base_dur *= 1.25
+            if is_slow_lang: 
+                base_dur *= 1.35 
+            if ph in ['PAUSE', 'BREATH']: 
+                base_dur = dur_ov
             else:
                 base_dur *= (1.0 + tempo_var)
-                if not stress and self.sentence_energy > 0.8: base_dur *= 0.9
+                if not stress and self.sentence_energy > 0.8: 
+                    base_dur *= 0.92
+            
+            # Apply voice profile duration scale
+            base_dur *= duration_scale
 
             tgt_f = p_data[1:5]
             tgt_amp = self.db_to_lin(p_data[5])
@@ -217,10 +258,12 @@ class TailSafetyEngine:
         n = len(tracks['pitch'])
         total = n * BLOCK_SAMPLES
         out = np.zeros(total, dtype=BIT_DEPTH)
-        phase = self.phase_acc 
-        raw_noise = np.random.normal(0, 0.4, total)
-        BW = [60.0, 90.0, 130.0, 180.0]
-        Gains = [1.0, 0.6, 0.4, 0.2]
+        phase = self.phase_acc
+        # Klatt-style: minimize noise, maximize formant filtering
+        noise_level = self.voice_profile['noise_level'] * 0.5  # Reduce noise for clarity
+        raw_noise = np.random.normal(0, noise_level, total)
+        BW = [60.0, 90.0, 130.0, 180.0]  # Slightly wider bandwidths for Klatt
+        Gains = [1.0, 0.7, 0.5, 0.2]     # More classic Klatt gain ratios
 
         for b in range(n):
             start, end = b*BLOCK_SAMPLES, (b+1)*BLOCK_SAMPLES
@@ -229,47 +272,60 @@ class TailSafetyEngine:
             av, af = tracks['AV'][b], tracks['AF'][b]
             ms, mm, mh = tracks['mix_s'][b], tracks['mix_mid'][b], tracks['mix_h'][b]
             burst = tracks['burst'][b]
-            
-            jit = np.random.uniform(-0.02, 0.02)
-            f0 = pitch * (1.0 + jit)
+
+            # Klatt-style voicing source: sawtooth
+            f0 = pitch
             inc = f0 / self.fs
             src = np.zeros(BLOCK_SAMPLES)
-            
             for i in range(BLOCK_SAMPLES):
                 phase += inc
                 if phase >= 1.0: phase -= 1.0
-                src[i] = 2.0 * (0.5 - phase)
-            
-            src, self.zi_tilt = signal.lfilter([1.0], [1.0, -0.90], src, zi=self.zi_tilt)
-            b_noise = signal.lfilter(*signal.butter(2, 1000, 'high', fs=self.fs), raw_noise[start:end])
-            src = (src * 0.70) + (b_noise * 0.30)
-            src *= av * 0.15
-            
+                src[i] = 2.0 * (phase - 0.5)
+
+            # Spectral tilt for brightness
+            tilt_coeff = 0.92 + (self.voice_profile['brightness'] * 0.05)
+            src, self.zi_tilt = signal.lfilter([1.0], [1.0, -tilt_coeff], src, zi=self.zi_tilt)
+            src *= av * 0.18
+
+            # Formant scaling
+            formant_scale = self.voice_profile['formant_scale']
+            scaled_f = [max(50, f_vals[i] / formant_scale) for i in range(4)]
+
+            # Klatt-style formant filters
             y_mix = np.zeros(BLOCK_SAMPLES)
             for i in range(4):
-                bc, ac = signal.iirpeak(max(100, f_vals[i]), max(100, f_vals[i])/BW[i], fs=self.fs)
+                freq = max(100, min(scaled_f[i], self.fs/2-100))
+                bw = BW[i]
+                bc, ac = signal.iirpeak(freq, freq/max(50, bw), fs=self.fs)
                 y, self.zi_f[i] = signal.lfilter(bc, ac, src, zi=self.zi_f[i])
                 y_mix += y * Gains[i]
             out[start:end] = y_mix
-            
+
+            # Fricatives: less noise, more filtered
             if af > 0.01:
                 cn = raw_noise[start:end]
                 total_n = np.zeros(BLOCK_SAMPLES)
                 if ms > 0:
-                    b, a = signal.butter(2, [3500, 6000], 'band', fs=self.fs)
-                    total_n += signal.lfilter(b, a, cn) * ms
+                    b, a = signal.butter(2, [3200, 5800], 'band', fs=self.fs)
+                    total_n += signal.lfilter(b, a, cn) * ms * 0.7
                 if mm > 0:
-                    b, a = signal.butter(2, [2000, 5000], 'band', fs=self.fs)
-                    total_n += signal.lfilter(b, a, cn) * mm
+                    b, a = signal.butter(2, [1800, 4500], 'band', fs=self.fs)
+                    total_n += signal.lfilter(b, a, cn) * mm * 0.7
                 if mh > 0:
-                    b, a = signal.butter(2, [max(400, f_vals[1]-500), f_vals[2]+500], 'band', fs=self.fs)
-                    total_n += signal.lfilter(b, a, cn) * mh
+                    freq_low = max(300, scaled_f[1]-600)
+                    freq_high = min(self.fs/2-100, scaled_f[2]+600)
+                    if freq_low < freq_high:
+                        b, a = signal.butter(2, [freq_low, freq_high], 'band', fs=self.fs)
+                        total_n += signal.lfilter(b, a, cn) * mh * 0.7
                 out[start:end] += total_n * af
 
+            # Bursts: classic Klatt pop
             if burst > 100:
-                pop = np.random.uniform(-1, 1, BLOCK_SAMPLES) * 4.0
-                b, a = signal.butter(2, [max(100, burst-500), burst+500], 'band', fs=self.fs)
-                out[start:end] += self.soft_clip(signal.lfilter(b, a, pop))
+                pop = np.random.uniform(-1, 1, BLOCK_SAMPLES) * 2.5
+                freq_low = max(50, burst-600)
+                freq_high = min(self.fs/2-100, burst+600)
+                b, a = signal.butter(2, [freq_low, freq_high], 'band', fs=self.fs)
+                out[start:end] += self.soft_clip(signal.lfilter(b, a, pop)) * 0.6
 
         self.phase_acc = phase
         return out
@@ -292,11 +348,15 @@ class TailSafetyEngine:
                 tracks = self.generate_tracks(current_batch)
                 if len(tracks['pitch']) > 0:
                     wave = self.synthesize(tracks)
-                    b, a = signal.butter(2, 9000, 'low', fs=self.fs)
+                    # Better filtering pipeline
+                    b, a = signal.butter(2, 8500, 'low', fs=self.fs)  # Slightly lower cutoff
                     wave = signal.lfilter(b, a, wave)
-                    wave = self.soft_clip(wave * 1.5)
+                    # Gentle additional high-pass to remove DC
+                    b, a = signal.butter(1, 20, 'high', fs=self.fs)
+                    wave = signal.lfilter(b, a, wave)
+                    wave = self.soft_clip(wave * 1.3)  # Slightly higher compression
                     mx = np.max(np.abs(wave))
-                    if mx > 0: wave = (wave/mx) * 0.95
+                    if mx > 0: wave = (wave/mx) * 0.92  # Better normalization
                     stream.write(wave.astype(np.float32))
                 current_batch = []
         stream.stop(); stream.close()
