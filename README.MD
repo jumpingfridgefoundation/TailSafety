@@ -1,4 +1,4 @@
-# Tail Safety Engine, alpha v40
+# Tail Safety Engine, alpha Experimental
 
 **Warning: This is not a production-ready TTS engine. This is what happens when we get bored and decide to synthesize human speech using raw math in 48 hours.**
 
