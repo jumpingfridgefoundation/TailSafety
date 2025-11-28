@@ -1,0 +1,15 @@
+TailSafety Version 46 Enhancements
+
+Enhancements from previous version (V41 to V46):
+
+1.  Replaced the install-on-import mechanism in g2p.py with a clear RuntimeError, improving security and user experience.
+2.  Implemented a robust voice profile fallback in main.py, preventing a KeyError when the voices directory is empty.
+3.  Corrected the Q factor calculation for iirpeak in src/engine.py, using the correct center_freq / bandwidth formula for accurate DSP.
+4.  Parameterized the sample rate (fs) in the numba function generate_formant_waves_jit, removing a hard-coded value.
+5.  Fixed stress parsing and punctuation handling in src/engine.py's parse_text method for more consistent text processing.
+6.  Hardened audio playback in src/engine.py's speak method using a context manager and error handling for sounddevice.
+7.  Added validation for required voice profile keys in src/engine.py's TailSafetyEngine.__init__ for better configuration safety.
+8.  Added a basic unit test file (tests.py) to validate core engine functionality.
+9.  Updated the main program's startup message to be cleaner and more user-friendly.
+10. Implemented new command structure: /voices for listing, 'voice <num/name>' for switching, and /log for future debug logging.
+11. Updated the version number displayed in the console to 46.
