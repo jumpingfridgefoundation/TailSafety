@@ -39,6 +39,13 @@ class TailSafetyEngine:
         # Require voice profile dict to be passed
         if voice_profile is None:
             raise ValueError("voice_profile dict must be provided")
+        
+        # Validate required keys (Fix 8)
+        required_keys = ['name', 'base_pitch', 'duration_scale', 'brightness', 'formant_scale', 'noise_level']
+        for key in required_keys:
+            if key not in voice_profile:
+                raise ValueError(f"Missing required key '{key}' in voice_profile.")
+                
         self.voice_profile = voice_profile
         self.voice_key = voice_profile.get('name', 'unknown')
         self.base_pitch = self.voice_profile['base_pitch']
@@ -64,8 +71,9 @@ class TailSafetyEngine:
         return 10.0 ** (db / 20.0)
 
     def parse_text(self, text):
-        clean_text = re.sub(r'[^\w\s\.,!?\u0400-\u04FF\u0600-\u06FF]', '', text)
-        tokens = re.split(r'([.,!?;])', clean_text)
+        # Keep semicolon for splitting, but allow it in the clean_text regex
+        clean_text = re.sub(r'[^\w\s\.,!?;:\u0400-\u04FF\u0600-\u06FF]', '', text)
+        tokens = re.split(r'([.,!?;:])', clean_text)
         full_stream = []
         temp_word_buffer = []
         sentence_counter = 0
@@ -90,7 +98,10 @@ class TailSafetyEngine:
                     pron, is_slow = self.g2p.predict(w)
                     for p in pron:
                         s = 0
-                        if p[-1].isdigit(): s = int(p[-1]); p = p.rstrip('012')
+                        # Handle stress marker (single digit at the end)
+                        if p and p[-1].isdigit(): 
+                            s = int(p[-1])
+                            p = p[:-1] # Remove the last character (the digit)
                         if p == 'HH': p = 'HH'
                         temp_word_buffer.append((p, 0, s, is_slow))
                     temp_word_buffer.append(('WORD_BOUNDARY', 0, 0))
@@ -295,8 +306,9 @@ class TailSafetyEngine:
             y_mix = np.zeros(BLOCK_SAMPLES)
             for i in range(4):
                 freq = max(100, min(scaled_f[i], self.fs/2-100))
-                bw = BW[i]
-                bc, ac = signal.iirpeak(freq, freq/max(50, bw), fs=self.fs)
+                bw = max(1.0, BW[i])  # Clamp bandwidth to avoid division by zero
+                Q = max(0.1, freq / bw) # Q = center_freq / bandwidth
+                bc, ac = signal.iirpeak(freq, Q, fs=self.fs)
                 y, self.zi_f[i] = signal.lfilter(bc, ac, src, zi=self.zi_f[i])
                 y_mix += y * Gains[i]
             out[start:end] = y_mix
@@ -334,29 +346,32 @@ class TailSafetyEngine:
         print(f" Synth: '{text}'")
         self.reset_filters() 
         full_stream = self.parse_text(text)
-        stream = sd.OutputStream(samplerate=self.fs, channels=1, dtype='float32')
-        stream.start()
         current_batch = []
         
-        for i, item in enumerate(full_stream):
-            current_batch.append(item)
-            is_mandatory = item[0] in ['PAUSE', 'BREATH', 'END_OF_STREAM']
-            is_boundary = (item[0] == 'WORD_BOUNDARY')
-            is_buffer_full = len(current_batch) > 15
-            
-            if is_mandatory or (is_boundary and is_buffer_full):
-                tracks = self.generate_tracks(current_batch)
-                if len(tracks['pitch']) > 0:
-                    wave = self.synthesize(tracks)
-                    # Better filtering pipeline
-                    b, a = signal.butter(2, 8500, 'low', fs=self.fs)  # Slightly lower cutoff
-                    wave = signal.lfilter(b, a, wave)
-                    # Gentle additional high-pass to remove DC
-                    b, a = signal.butter(1, 20, 'high', fs=self.fs)
-                    wave = signal.lfilter(b, a, wave)
-                    wave = self.soft_clip(wave * 1.3)  # Slightly higher compression
-                    mx = np.max(np.abs(wave))
-                    if mx > 0: wave = (wave/mx) * 0.92  # Better normalization
-                    stream.write(wave.astype(np.float32))
-                current_batch = []
-        stream.stop(); stream.close()
+        try:
+            with sd.OutputStream(samplerate=self.fs, channels=1, dtype='float32') as stream:
+                for i, item in enumerate(full_stream):
+                    current_batch.append(item)
+                    is_mandatory = item[0] in ['PAUSE', 'BREATH', 'END_OF_STREAM']
+                    is_boundary = (item[0] == 'WORD_BOUNDARY')
+                    is_buffer_full = len(current_batch) > 15
+                    
+                    if is_mandatory or (is_boundary and is_buffer_full):
+                        tracks = self.generate_tracks(current_batch)
+                        if len(tracks['pitch']) > 0:
+                            wave = self.synthesize(tracks)
+                            # Better filtering pipeline
+                            b, a = signal.butter(2, 8500, 'low', fs=self.fs)  # Slightly lower cutoff
+                            wave = signal.lfilter(b, a, wave)
+                            # Gentle additional high-pass to remove DC
+                            b, a = signal.butter(1, 20, 'high', fs=self.fs)
+                            wave = signal.lfilter(b, a, wave)
+                            wave = self.soft_clip(wave * 1.3)  # Slightly higher compression
+                            mx = np.max(np.abs(wave))
+                            if mx > 0: wave = (wave/mx) * 0.92  # Better normalization
+                            stream.write(wave.astype(np.float32))
+                        current_batch = []
+        except sd.PortAudioError as e:
+            print(f"Audio Error: Could not open audio stream. Check your sound device settings. Details: {e}")
+        except Exception as e:
+            print(f"An unexpected error occurred during playback: {e}")

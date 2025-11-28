@@ -3,11 +3,9 @@ try:
     from g2p_en import G2p as G2P_EN
     G2P_ENGLISH = G2P_EN()
 except ImportError:
-    print("Installing g2p-en...")
-    import subprocess
-    subprocess.run(['pip', 'install', 'g2p-en'], check=True)
-    from g2p_en import G2p as G2P_EN
-    G2P_ENGLISH = G2P_EN()
+    raise RuntimeError(
+        "Missing dependency: g2p-en. Install with `pip install g2p-en` and retry."
+    )
 
 
 class MultiLingualG2P:
