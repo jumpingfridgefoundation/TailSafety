@@ -12,4 +12,3 @@ Enhancements from previous version (V41 to V46):
 8.  Added a basic unit test file (tests.py) to validate core engine functionality.
 9.  Updated the main program's startup message to be cleaner and more user-friendly.
 10. Implemented new command structure: /voices for listing, 'voice <num/name>' for switching, and /log for future debug logging.
-11. Updated the version number displayed in the console to 46.
